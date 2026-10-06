@@ -63,8 +63,8 @@ def gmres_callback(residual_norm):
 
 def linear_solver(file, ep_in, ep_ex, k, maxiter=100, gmrs_maxiter=2000, mu='None', assembler='dense',
                        dtol=1e-3, gmres_rtol=1e-5, gmres_atol=0., external_mesh='None', SOR = 0.7,
-                       d_min=0.3, d_max=2.0, h_min=0.3, h_max=0.5, probe_radius=1.4, stern_thickness=3.0,
-                       algorithm=10, grid_scale=1.0, new_mesh=False):
+                       gradation=0.1, probe_radius=1.4, stern_thickness=3.0,
+                       algorithm=10, grid_scale=2.0, new_mesh=False):
 
     from coupled_solver import dir_name
     global residuals
@@ -75,11 +75,9 @@ def linear_solver(file, ep_in, ep_ex, k, maxiter=100, gmrs_maxiter=2000, mu='Non
                connections_12, connections_13, \
                pointer_connections_12, pointer_connections_13, \
                p12scale, p13scale, N = read_tinker('molecules/'+file, float)
-
-    N = x_q.shape[0]
     
     if external_mesh != 'None':
-        mesh, cell_tags, facet_tags = load_dolfin_mesh(external_mesh, d_min, d_max, h_min, h_max, probe_radius, stern_thickness, algorithm, grid_scale)
+        mesh, cell_tags, facet_tags = load_dolfin_mesh(external_mesh, gradation, probe_radius, stern_thickness, algorithm, grid_scale)
     else:
         try:
             mol_name = file.split('/')[-1]
@@ -91,7 +89,7 @@ def linear_solver(file, ep_in, ep_ex, k, maxiter=100, gmrs_maxiter=2000, mu='Non
                 for archivo in glob.glob(boundary_mesh_path):
                     if os.path.isfile(archivo):
                         os.remove(archivo)
-            mesh, cell_tags, facet_tags = load_dolfin_mesh(mol_name, d_min, d_max, h_min, h_max, probe_radius, stern_thickness, algorithm, grid_scale)
+            mesh, cell_tags, facet_tags = load_dolfin_mesh(mol_name, gradation, probe_radius, stern_thickness, algorithm, grid_scale)
         except:
             raise ValueError(F'No se encontro malla {mol_name} ni archivos para generarla')
 
@@ -151,6 +149,8 @@ def linear_solver(file, ep_in, ep_ex, k, maxiter=100, gmrs_maxiter=2000, mu='Non
 
     #--- Definir espacios funcionales ---#
 
+    time_init_spaces = time.time()
+
     fenics_space = fem.functionspace(mesh, ('Lagrange', 2)) # Espacio de funciones para FEM (H1)
     P1_space = fem.functionspace(mesh, ('Lagrange', 1)) # Espacio para la condición de Neumann
     dirichlet_space_ses = bempp_cl.api.function_space(ses_mesh, 'P', 1)
@@ -160,6 +160,10 @@ def linear_solver(file, ep_in, ep_ex, k, maxiter=100, gmrs_maxiter=2000, mu='Non
     trace_matrix = _compute_trace_matrix(fenics_space, stern_nodes)
     trace_ses = _compute_trace_matrix(P1_space, ses_nodes)
     trace_stern = _compute_trace_matrix(P1_space, stern_nodes)
+
+    time_final_spaces = time.time()
+
+    print(f'Time to define spaces: {(time_final_spaces - time_init_spaces):.2f} [s]')
 
     fem_ndof = fenics_space.dofmap.index_map.size_global
     bem_ndof = dirichlet_space_stern.global_dof_count
@@ -183,6 +187,8 @@ def linear_solver(file, ep_in, ep_ex, k, maxiter=100, gmrs_maxiter=2000, mu='Non
     x_dofs_solute = x_dofs[solute_dofs]
 
     phi0_dofs = np.zeros(fem_ndof)
+
+    time_init_pot = time.time()
     
     slpo_dofs = single_layer(neumann_space_ses, np.transpose(x_dofs_solute))
     dlpo_dofs = double_layer(dirichlet_space_ses, np.transpose(x_dofs_solute))
@@ -190,7 +196,13 @@ def linear_solver(file, ep_in, ep_ex, k, maxiter=100, gmrs_maxiter=2000, mu='Non
     slpo_mult = single_layer(neumann_space_ses, np.transpose(x_q))
     dlpo_mult = double_layer(dirichlet_space_ses, np.transpose(x_q))
 
+    time_final_pot = time.time()
+
+    print(f'Time to define potential operators: {(time_final_pot - time_init_pot):.2f} [s]')
+
     #--- Lado izquierdo de la ecuación (Constante) ---#
+
+    time_init_operators = time.time()
 
     u = ufl.TrialFunction(fenics_space) # función de aproximación
     v = ufl.TestFunction(fenics_space) # Función de prueba
@@ -224,6 +236,12 @@ def linear_solver(file, ep_in, ep_ex, k, maxiter=100, gmrs_maxiter=2000, mu='Non
     iv, jv, kv = mass_matrix.getValuesCSR()
     mass_matrix_sparse = scipy.sparse.csr_matrix((kv, jv, iv), shape=mass_matrix.getSize())
 
+    time_final_operators = time.time()
+
+    print(f'Time to define boundary and FEM operators: {(time_final_operators - time_init_operators):.2f} [s]')
+
+    time_init_lhs = time.time()
+
     blocks = [[None,None],[None,None]]
 
     blocks[0][0] = A.weak_form()
@@ -233,55 +251,142 @@ def linear_solver(file, ep_in, ep_ex, k, maxiter=100, gmrs_maxiter=2000, mu='Non
 
     cterm_lhs = BlockedDiscreteOperator(np.array(blocks)) # Lado izquierdo de la ecuación
 
+    time_final_lhs = time.time()
+    print(f'Time to assemble LHS: {(time_final_lhs - time_init_lhs):.2f} [s]')
     P = precon(cterm_lhs, neumann_space_stern)
 
     #--- Parte constante del lado derecho ---#
     #--- Grid functions ---#
 
+    time_init_rhs = time.time()
+
+    #@bempp_cl.api.real_callable
+    #def charges_fun_perm(x, n, i, result):
+    #    T2 = np.zeros((len(x_q),3,3))
+    #    dist = x - x_q
+    #    norm = np.sqrt(np.sum((dist*dist), axis = 1))
+    #    T0 = 1/norm[:]
+    #    T1 = np.transpose(dist.transpose()/norm**3)
+    #    T2[:,:,:] = np.ones((len(x_q),3,3))[:]*dist.reshape((len(x_q),1,3))*np.transpose(np.ones((len(x_q),3,3))*dist.reshape((len(x_q),1,3)), (0,2,1))/norm.reshape((len(x_q),1,1))**5
+    #    phi_c = np.sum(q[:]*T0[:]) + np.sum(T1[:]*d[:]) + 0.5*np.sum(np.sum(T2[:]*Q[:],axis=1))
+    #    result[0] = phi_c/(4*np.pi*ep_in)
     @bempp_cl.api.real_callable
     def charges_fun_perm(x, n, i, result):
-        T2 = np.zeros((len(x_q),3,3))
-        dist = x - x_q
-        norm = np.sqrt(np.sum((dist*dist), axis = 1))
-        T0 = 1/norm[:]
-        T1 = np.transpose(dist.transpose()/norm**3)
-        T2[:,:,:] = np.ones((len(x_q),3,3))[:]*dist.reshape((len(x_q),1,3))*np.transpose(np.ones((len(x_q),3,3))*dist.reshape((len(x_q),1,3)), (0,2,1))/norm.reshape((len(x_q),1,1))**5
-        phi_c = np.sum(q[:]*T0[:]) + np.sum(T1[:]*d[:]) + 0.5*np.sum(np.sum(T2[:]*Q[:],axis=1))
+        phi_c = 0.0
+        for j in range(len(x_q)):
+            dx = x[0] - x_q[j, 0]
+            dy = x[1] - x_q[j, 1]
+            dz = x[2] - x_q[j, 2]
+            norm = np.sqrt(dx*dx + dy*dy + dz*dz)
+            if norm > 1e-10:
+                T0 = 1/norm
+                phi_c += q[j] * T0
+                
+                T1_x = dx/(norm**3)
+                T1_y = dy/(norm**3)
+                T1_z = dz/(norm**3)
+                phi_c += T1_x*d[j,0] + T1_y*d[j,1] + T1_z*d[j,2]
+                
+                T2_xx = (dx * dx)/(2*norm**5)
+                T2_xy = (dx * dy)/(2*norm**5)
+                T2_xz = (dx * dz)/(2*norm**5)
+                T2_yx = (dy * dx)/(2*norm**5)
+                T2_yy = (dy * dy)/(2*norm**5)
+                T2_yz = (dy * dz)/(2*norm**5)
+                T2_zx = (dz * dx)/(2*norm**5)
+                T2_zy = (dz * dy)/(2*norm**5)
+                T2_zz = (dz * dz)/(2*norm**5)
+                phi_c += T2_xx*Q[j,0,0] + T2_xy*Q[j,0,1] + T2_xz*Q[j,0,2]
+                phi_c += T2_yx*Q[j,1,0] + T2_yy*Q[j,1,1] + T2_yz*Q[j,1,2]
+                phi_c += T2_zx*Q[j,2,0] + T2_zy*Q[j,2,1] + T2_zz*Q[j,2,2]
         result[0] = phi_c/(4*np.pi*ep_in)
-    
+
     G_fun_perm = bempp_cl.api.GridFunction(dirichlet_space_ses, fun = charges_fun_perm)
+
+    #@bempp_cl.api.real_callable
+    #def lambda_fun_perm(x, n, i, result):
+    #    dist = x - x_q
+    #    norm = np.sqrt(np.sum((dist*dist), axis = 1))
+    #    dphi = np.zeros((3))
+    #
+    #    T2 = np.zeros((3, 3, 3))
+    #
+    #    for j in np.where(norm > 1e-10)[0]:
+    #        T0 = -dist[j,:] / norm[j]**3    
+    #        T1 = np.identity(3)/norm[j]**3 - 3*np.ones((3,3)) * dist[j,:] * np.transpose(np.ones((3,3)) * dist[j,:])/norm[j]**5
+    #
+    #        aux = np.zeros((3,3,3))
+    #
+    #        for k in range(3):
+    #            aux[k,:,:] = np.ones((3,3)) * dist[j,:] * np.transpose(np.ones((3,3)) * dist[j,:])*dist[j,k]
+    #        aux *= -5/norm[j]**7
+    #
+    #        for k in range(3):
+    #            aux[:,:,k] += np.identity(3) * dist[j,k] / norm[j]**5
+    #
+    #        for k in range(3):
+    #            aux[:,k,:] += np.identity(3) * dist[j,k] / norm[j]**5
+    #
+    #        T2 = aux
+    #
+    #        for k in range(3):
+    #            dphi[k] += T0[k]*q[j] + np.sum(T1[k,:] * d[j,:]) + 0.5 * np.sum(np.sum(T2[k,:,:] * Q[j,:,:], axis = 1), axis = 0)
+    #
+    #    dphi /=  (4*np.pi*ep_in)
+    #    result[0] =  np.dot(n, dphi) # Derivada direccional en la dirección normal
 
     @bempp_cl.api.real_callable
     def lambda_fun_perm(x, n, i, result):
-        dist = x - x_q
-        norm = np.sqrt(np.sum((dist*dist), axis = 1))
-        dphi = np.zeros((3))
-    
-        T2 = np.zeros((3, 3, 3))
-    
-        for j in np.where(norm > 1e-10)[0]:
-            T0 = -dist[j,:] / norm[j]**3    
-            T1 = np.identity(3)/norm[j]**3 - 3*np.ones((3,3)) * dist[j,:] * np.transpose(np.ones((3,3)) * dist[j,:])/norm[j]**5
-    
-            aux = np.zeros((3,3,3))
-    
-            for k in range(3):
-                aux[k,:,:] = np.ones((3,3)) * dist[j,:] * np.transpose(np.ones((3,3)) * dist[j,:])*dist[j,k]
-            aux *= -5/norm[j]**7
-    
-            for k in range(3):
-                aux[:,:,k] += np.identity(3) * dist[j,k] / norm[j]**5
-    
-            for k in range(3):
-                aux[:,k,:] += np.identity(3) * dist[j,k] / norm[j]**5
-    
-            T2 = aux
-    
-            for k in range(3):
-                dphi[k] += T0[k]*q[j] + np.sum(T1[k,:] * d[j,:]) + 0.5 * np.sum(np.sum(T2[k,:,:] * Q[j,:,:], axis = 1), axis = 0)
-    
-        dphi /=  (4*np.pi*ep_in)
-        result[0] =  np.dot(n, dphi) # Derivada direccional en la dirección normal
+        dphi_x = 0.0
+        dphi_y = 0.0
+        dphi_z = 0.0
+        for j in range(len(x_q)):
+            dx = x[0] - x_q[j, 0]
+            dy = x[1] - x_q[j, 1]
+            dz = x[2] - x_q[j, 2]
+            norm = np.sqrt(dx*dx + dy*dy + dz*dz)
+            if norm > 1e-10:
+                r2 = norm**2
+                r3 = norm**3
+                r5 = r3 * r2
+                r7 = r5 * r2
+
+                T0_x = -dx/r3
+                T0_y = -dy/r3
+                T0_z = -dz/r3
+                dphi_x += T0_x * q[j]
+                dphi_y += T0_y * q[j]
+                dphi_z += T0_z * q[j]
+
+                dot_rd = dx*d[i,0] + dy*d[i,1] + dz*d[i,2]
+                T1_x = d[i, 0]/r3 - 3.0 * dx * dot_rd / r5
+                T1_y = d[i, 1]/r3 - 3.0 * dy * dot_rd / r5
+                T1_z = d[i, 2]/r3 - 3.0 * dz * dot_rd / r5
+
+                dphi_x += T1_x
+                dphi_y += T1_y
+                dphi_z += T1_z
+
+                Q_rr = (dx*dx*Q[j,0,0] + dx*dy*Q[j,0,1] + dx*dz*Q[j,0,2] +
+                        dy*dx*Q[j,1,0] + dy*dy*Q[j,1,1] + dy*dz*Q[j,1,2] +
+                        dz*dx*Q[j,2,0] + dz*dy*Q[j,2,1] + dz*dz*Q[j,2,2])
+
+                Q_rx = dx * Q[j,0,0] + dy * Q[j,0,1] + dz * Q[j,0,2]
+                Q_ry = dx * Q[j,1,0] + dy * Q[j,1,1] + dz * Q[j,1,2]
+                Q_rz = dx * Q[j,2,0] + dy * Q[j,2,1] + dz * Q[j,2,2]
+
+                T2_x = Q_rx/r5 - 2.5 * dx * Q_rr / r7
+                T2_y = Q_ry/r5 - 2.5 * dy * Q_rr / r7
+                T2_z = Q_rz/r5 - 2.5 * dz * Q_rr / r7
+
+                dphi_x += T2_x
+                dphi_y += T2_y
+                dphi_z += T2_z
+
+        dphi_x /= (4.0 * np.pi * ep_in)
+        dphi_y /= (4.0 * np.pi * ep_in)
+        dphi_z /= (4.0 * np.pi * ep_in)
+        result[0] = n[0]*dphi_x + n[1]*dphi_y + n[2]*dphi_z
 
     dGdn_fun_perm = bempp_cl.api.GridFunction(dirichlet_space_ses, fun = lambda_fun_perm)
 
@@ -303,17 +408,37 @@ def linear_solver(file, ep_in, ep_ex, k, maxiter=100, gmrs_maxiter=2000, mu='Non
     neumann_values_perm = cterm_rhs_perm.coefficients
     fem_rhs_perm = mass_ses_sparse @ (trace_ses.T @ neumann_values_perm)
 
+    time_final_rhs = time.time()
+
+    print(f'Time to assembly permanent part of the RHS: {(time_final_rhs - time_init_rhs):.2f} [s]')
+
     for iter_number in range(maxiter):
         print(F"------- Dipole iteration {iter_number + 1} -------")
     
         #--- 1. Resolver la ecuación para la componente armónica ---#
 
+        #@bempp_cl.api.real_callable
+        #def charges_fun_var(x, n, i, result):
+        #    dist = x - x_q
+        #    norm = np.sqrt(np.sum((dist*dist), axis = 1))
+        #    T1 = np.transpose(dist.transpose()/norm**3)
+        #    phi_c = np.sum(T1[:]*mu[:]) # Solo considera la componente polarizable, la componente permanente se considera en el lado constante del RHS
+        #    result[0] = phi_c/(4*np.pi*ep_in)
         @bempp_cl.api.real_callable
         def charges_fun_var(x, n, i, result):
-            dist = x - x_q
-            norm = np.sqrt(np.sum((dist*dist), axis = 1))
-            T1 = np.transpose(dist.transpose()/norm**3)
-            phi_c = np.sum(T1[:]*mu[:]) # Solo considera la componente polarizable, la componente permanente se considera en el lado constante del RHS
+            phi_c = 0.0
+            for j in range(len(x_q)):
+                dx = x[0] - x_q[j, 0]
+                dy = x[1] - x_q[j, 1]
+                dz = x[2] - x_q[j, 2]
+                norm = np.sqrt(dx*dx + dy*dy + dz*dz)
+                if norm > 1e-10:
+            
+                    T1_x = dx/(norm**3)
+                    T1_y = dy/(norm**3)
+                    T1_z = dz/(norm**3)
+                    phi_c += T1_x*mu[j,0] + T1_y*mu[j,1] + T1_z*mu[j,2]
+            
             result[0] = phi_c/(4*np.pi*ep_in)
 
         G_fun_var = bempp_cl.api.GridFunction(dirichlet_space_ses, fun = charges_fun_var)
@@ -323,20 +448,47 @@ def linear_solver(file, ep_in, ep_ex, k, maxiter=100, gmrs_maxiter=2000, mu='Non
 
         #--- 2. Resolver el sistema para la componente de corrección ---#
 
+        #@bempp_cl.api.real_callable
+        #def lambda_fun_var(x, n, i, result):
+        #    dist = x - x_q
+        #    norm = np.sqrt(np.sum((dist*dist), axis = 1))
+        #    dphi = np.zeros((3))
+        #    
+        #    for j in np.where(norm > 1e-10)[0]:  
+        #        T1 = np.identity(3)/norm[j]**3 - 3*np.ones((3,3)) * dist[j,:] * np.transpose(np.ones((3,3)) * dist[j,:])/norm[j]**5
+        #    
+        #        for k in range(3):
+        #            dphi[k] += np.sum(T1[k,:] * mu[j,:])
+        #    
+        #    dphi /=  (4*np.pi*ep_in)
+        #    result[0] =  np.dot(n, dphi) # Derivada direccional en la dirección normal
         @bempp_cl.api.real_callable
         def lambda_fun_var(x, n, i, result):
-            dist = x - x_q
-            norm = np.sqrt(np.sum((dist*dist), axis = 1))
-            dphi = np.zeros((3))
+            dphi_x = 0.0
+            dphi_y = 0.0
+            dphi_z = 0.0
+            for j in range(len(x_q)):
+                dx = x[0] - x_q[j, 0]
+                dy = x[1] - x_q[j, 1]
+                dz = x[2] - x_q[j, 2]
+                norm = np.sqrt(dx*dx + dy*dy + dz*dz)
+                if norm > 1e-10:
+                    r3 = norm**3
+                    r5 = r3 * norm**2
             
-            for j in np.where(norm > 1e-10)[0]:  
-                T1 = np.identity(3)/norm[j]**3 - 3*np.ones((3,3)) * dist[j,:] * np.transpose(np.ones((3,3)) * dist[j,:])/norm[j]**5
+                    dot_rd = dx*mu[i,0] + dy*mu[i,1] + dz*mu[i,2]
+                    T1_x = mu[i, 0]/r3 - 3.0 * dx * dot_rd / r5
+                    T1_y = mu[i, 1]/r3 - 3.0 * dy * dot_rd / r5
+                    T1_z = mu[i, 2]/r3 - 3.0 * dz * dot_rd / r5
             
-                for k in range(3):
-                    dphi[k] += np.sum(T1[k,:] * mu[j,:])
+                    dphi_x += T1_x
+                    dphi_y += T1_y
+                    dphi_z += T1_z
             
-            dphi /=  (4*np.pi*ep_in)
-            result[0] =  np.dot(n, dphi) # Derivada direccional en la dirección normal
+            dphi_x /= (4.0 * np.pi * ep_in)
+            dphi_y /= (4.0 * np.pi * ep_in)
+            dphi_z /= (4.0 * np.pi * ep_in)
+            result[0] = n[0]*dphi_x + n[1]*dphi_y + n[2]*dphi_z
             
         dGdn_fun_var = bempp_cl.api.GridFunction(dirichlet_space_ses, fun = lambda_fun_var)
             

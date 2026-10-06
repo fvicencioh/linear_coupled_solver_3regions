@@ -1,6 +1,6 @@
-Grid_scale = 01.2 
+Grid_scale = 00.7 
 Grid_perfil = 90.0 
-XYZR_FileName = /home/fvicencio/non-linear_solver/coupled_solver/ExternalSoftware/NanoShaper/meshs/1pgb_stern/1pgb_stern.xyzr 
+XYZR_FileName = /home/fvicencio/linear_coupled_solver_3regions/coupled_solver/ExternalSoftware/NanoShaper/meshs/1pgb_stern/1pgb_stern.xyzr 
 Build_epsilon_maps = false
 Build_status_map = false
 Save_Mesh_MSMS_Format = true

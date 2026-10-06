@@ -128,7 +128,7 @@ def _create_stern_xyzr(file, thickness):
     xyzr_file.close()
     stern_file.close()
 
-def _create_volumetric_mesh(name, d_min, d_max, h_min, h_max, probe_radius, stern_thickness, algorithm, grid_scale):
+def _create_volumetric_mesh(name, gradation, probe_radius, stern_thickness, algorithm, grid_scale):
     from coupled_solver import dir_name
     base = os.path.dirname(dir_name)
     xyzr_filepath = os.path.join(base, 'molecules', name, f'{name}.xyzr')
@@ -216,18 +216,29 @@ def _create_volumetric_mesh(name, d_min, d_max, h_min, h_max, probe_radius, ster
     gmsh.model.mesh.field.add("Distance", 1)
     gmsh.model.mesh.field.setNumbers(1, "SurfacesList", [surf_ses_tag])
 
-    gmsh.model.mesh.field.add("Threshold", 2)
-    gmsh.model.mesh.field.setNumber(2, "InField", 1)
-    gmsh.model.mesh.field.setNumber(2, "SizeMin", h_min)   
-    gmsh.model.mesh.field.setNumber(2, "SizeMax", h_max)      
-    gmsh.model.mesh.field.setNumber(2, "DistMin", d_min)
-    gmsh.model.mesh.field.setNumber(2, "DistMax", d_max)
+    # Experimento con Matheval
+    surface_size = 1.0 / grid_scale # hmin aproximado en base a triangulos de la ses
+
+    gmsh.model.mesh.field.add("MathEval", 2)
+    gmsh.model.mesh.field.setString(2, "F", f"{surface_size} + {gradation} * F1")
+
+    #gmsh.model.mesh.field.add("Threshold", 2)
+    #gmsh.model.mesh.field.setNumber(2, "InField", 1)
+    #gmsh.model.mesh.field.setNumber(2, "SizeMin", h_min)   
+    #gmsh.model.mesh.field.setNumber(2, "SizeMax", h_max)      
+    #gmsh.model.mesh.field.setNumber(2, "DistMin", d_min)
+    #gmsh.model.mesh.field.setNumber(2, "DistMax", d_max)
 
     #h_stern = h_min * 0.5 # Revisar el valor apropiado
-    gmsh.model.mesh.field.add("Constant", 3)
-    gmsh.model.mesh.field.setNumber(3, "VIn", h_min)
-    gmsh.model.mesh.field.setNumber(3, "VOut", h_max)
-    gmsh.model.mesh.field.setNumbers(3, "VolumesList", [vol_stern])
+    #gmsh.model.mesh.field.add("Constant", 3)
+    #gmsh.model.mesh.field.setNumber(3, "VIn", h_min)
+    #gmsh.model.mesh.field.setNumber(3, "VOut", h_max)
+    #gmsh.model.mesh.field.setNumbers(3, "VolumesList", [vol_stern])
+
+    gmsh.model.mesh.field.add("Restrict", 3)
+    gmsh.model.mesh.field.setNumber(3, "InField", 2)
+    gmsh.model.mesh.field.setNumbers(3, "VolumesList", [vol_solute])
+    gmsh.model.mesh.field.setAsBackgroundMesh(3)
 
     gmsh.model.mesh.field.add("Min", 4)
     gmsh.model.mesh.field.setNumbers(4, "FieldsList", [2, 3])
@@ -244,7 +255,7 @@ def _create_volumetric_mesh(name, d_min, d_max, h_min, h_max, probe_radius, ster
     os.makedirs(dir_name+'/volumetric_mesh/', exist_ok=True)
     gmsh.write(dir_name+'/volumetric_mesh/'+ name +'.msh')
 
-def load_dolfin_mesh(molecule, d_min, d_max, h_min, h_max, probe_radius, stern_thickness, algorithm, grid_scale):
+def load_dolfin_mesh(molecule, gradation, probe_radius, stern_thickness, algorithm, grid_scale):
     """
     Import or create the volumetric mesh for the input molecule.
     """
@@ -253,7 +264,7 @@ def load_dolfin_mesh(molecule, d_min, d_max, h_min, h_max, probe_radius, stern_t
     mesh_path = os.path.join(dir_name, 'volumetric_mesh', f'{molecule}.msh')
     if not os.path.exists(mesh_path):
         print(f'Volumetric mesh for {molecule} could not be found. Creating...')
-        _create_volumetric_mesh(molecule, d_min, d_max, h_min, h_max, probe_radius, stern_thickness, algorithm, grid_scale)
+        _create_volumetric_mesh(molecule, gradation, probe_radius, stern_thickness, algorithm, grid_scale)
 
     print(f'Loading volumetric mesh from {mesh_path}')
     mesh, cell_tags, facet_tags = gmshio.read_from_msh(

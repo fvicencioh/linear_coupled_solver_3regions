@@ -5,6 +5,7 @@ import ufl
 import bempp_cl.api
 import petsc4py
 import scipy.sparse
+import os
 
 from bempp_cl.api.external import fenicsx
 from dolfinx import fem, default_scalar_type
@@ -619,8 +620,8 @@ def gmres_callback(residual_norm):
         print(f"GMRES iter {len(residuals):4d} | residual = {residual_norm:.3e}")
 
 def solvation_energy_sphere(x_q, q, d_scaled, Q_scaled, alpha, ep_in, ep_ex, kappa, external_mesh,
-                            dtol=1e-3, maxiter=50, SOR=0.7, gmres_rtol=1e-5, gmres_atol=0., d_min=0.3,
-                            d_max=2.0, h_min=0.2, h_max=0.5, probe_radius=1.4, stern_thickness=2.0,
+                            dtol=1e-3, maxiter=50, SOR=0.7, gmres_rtol=1e-5, gmres_atol=0., 
+                            grid_scale = 2.0, gradation = 0.1,  probe_radius=1.4, stern_thickness=2.0,
                             algorithm=10):
     
     bohr = 0.52917721067 
@@ -632,7 +633,7 @@ def solvation_energy_sphere(x_q, q, d_scaled, Q_scaled, alpha, ep_in, ep_ex, kap
     N = x_q.shape[0]
     mu = np.zeros((N,3))
 
-    mesh, cell_tags, facet_tags = load_dolfin_mesh(external_mesh, d_min, d_max, h_min, h_max, probe_radius, stern_thickness, algorithm)
+    mesh, cell_tags, facet_tags = load_dolfin_mesh(external_mesh, gradation, probe_radius, stern_thickness, algorithm, grid_scale)
     #check_charge_mesh_distance(mesh, x_q, cell_tags=cell_tags, solute_marker=1, verbose=True)
 
     tdim = mesh.topology.dim
@@ -676,6 +677,25 @@ def solvation_energy_sphere(x_q, q, d_scaled, Q_scaled, alpha, ep_in, ep_ex, kap
     print("BEM dofs: {0}".format(bem_ndof))
     print("Total dofs: {0}".format(total_ndof))
 
+    #--- Operadores potenciales ---#
+    
+    x_dofs = fenics_space.tabulate_dof_coordinates() # ndof x 3
+    solute_dofs = set() # Para almacenar los dof del volumen 1 sin repetir.
+    for cell_idx in solute_cells:
+        cell_ndofs = fenics_space.dofmap.cell_dofs(cell_idx)
+        for dof in cell_ndofs:
+            solute_dofs.add(dof)
+    solute_dofs = list(solute_dofs)
+    x_dofs_solute = x_dofs[solute_dofs]
+    
+    phi0_dofs = np.zeros(fem_ndof)
+    
+    slpo_dofs = single_layer(neumann_space_ses, np.transpose(x_dofs_solute))
+    dlpo_dofs = double_layer(dirichlet_space_ses, np.transpose(x_dofs_solute))
+    
+    slpo_mult = single_layer(neumann_space_ses, np.transpose(x_q))
+    dlpo_mult = double_layer(dirichlet_space_ses, np.transpose(x_q))
+
     u = ufl.TrialFunction(fenics_space) # función de aproximación
     lam = ufl.TrialFunction(P1_space) # función P1 para los datos de frontera
     v = ufl.TestFunction(fenics_space) # Función de prueba
@@ -686,9 +706,6 @@ def solvation_energy_sphere(x_q, q, d_scaled, Q_scaled, alpha, ep_in, ep_ex, kap
     
     VL = laplace.single_layer(neumann_space_ses, dirichlet_space_ses, neumann_space_ses)
     KL = laplace.double_layer(dirichlet_space_ses, dirichlet_space_ses, neumann_space_ses)
-
-    VYs = modified_helmholtz.single_layer(dirichlet_space_ses, dirichlet_space_ses, dirichlet_space_ses, kappa);
-    KYs = modified_helmholtz.double_layer(neumann_space_ses, dirichlet_space_ses, dirichlet_space_ses, kappa);
         
     VY = modified_helmholtz.single_layer(dirichlet_space_stern, dirichlet_space_stern, dirichlet_space_stern, kappa);
     KY = modified_helmholtz.double_layer(neumann_space_stern, dirichlet_space_stern, dirichlet_space_stern, kappa);
@@ -743,48 +760,89 @@ def solvation_energy_sphere(x_q, q, d_scaled, Q_scaled, alpha, ep_in, ep_ex, kap
     
     @bempp_cl.api.real_callable
     def charges_fun_perm(x, n, i, result):
-        T2 = np.zeros((len(x_q),3,3))
-        dist = x - x_q
-        norm = np.sqrt(np.sum((dist*dist), axis = 1))
-        T0 = 1/norm[:]
-        T1 = np.transpose(dist.transpose()/norm**3)
-        T2[:,:,:] = np.ones((len(x_q),3,3))[:]*dist.reshape((len(x_q),1,3))*np.transpose(np.ones((len(x_q),3,3))*dist.reshape((len(x_q),1,3)), (0,2,1))/norm.reshape((len(x_q),1,1))**5
-        phi_c = np.sum(q[:]*T0[:]) + np.sum(T1[:]*d[:]) + 0.5*np.sum(np.sum(T2[:]*Q[:],axis=1))
+        phi_c = 0.0
+        for j in range(len(x_q)):
+            dx = x[0] - x_q[j, 0]
+            dy = x[1] - x_q[j, 1]
+            dz = x[2] - x_q[j, 2]
+            norm = np.sqrt(dx*dx + dy*dy + dz*dz)
+            if norm > 1e-10:
+                T0 = 1/norm
+                phi_c += q[j] * T0
+    
+                T1_x = dx/(norm**3)
+                T1_y = dy/(norm**3)
+                T1_z = dz/(norm**3)
+                phi_c += T1_x*d[j,0] + T1_y*d[j,1] + T1_z*d[j,2]
+    
+                T2_xx = (dx * dx)/(2*norm**5)
+                T2_xy = (dx * dy)/(2*norm**5)
+                T2_xz = (dx * dz)/(2*norm**5)
+                T2_yx = (dy * dx)/(2*norm**5)
+                T2_yy = (dy * dy)/(2*norm**5)
+                T2_yz = (dy * dz)/(2*norm**5)
+                T2_zx = (dz * dx)/(2*norm**5)
+                T2_zy = (dz * dy)/(2*norm**5)
+                T2_zz = (dz * dz)/(2*norm**5)
+                phi_c += T2_xx*Q[j,0,0] + T2_xy*Q[j,0,1] + T2_xz*Q[j,0,2]
+                phi_c += T2_yx*Q[j,1,0] + T2_yy*Q[j,1,1] + T2_yz*Q[j,1,2]
+                phi_c += T2_zx*Q[j,2,0] + T2_zy*Q[j,2,1] + T2_zz*Q[j,2,2]
         result[0] = phi_c/(4*np.pi*ep_in)
     
     G_fun_perm = bempp_cl.api.GridFunction(dirichlet_space_ses, fun = charges_fun_perm)
 
     @bempp_cl.api.real_callable
     def lambda_fun_perm(x, n, i, result):
-        dist = x - x_q
-        norm = np.sqrt(np.sum((dist*dist), axis = 1))
-        dphi = np.zeros((3))
+        dphi_x = 0.0
+        dphi_y = 0.0
+        dphi_z = 0.0
+        for j in range(len(x_q)):
+            dx = x[0] - x_q[j, 0]
+            dy = x[1] - x_q[j, 1]
+            dz = x[2] - x_q[j, 2]
+            norm = np.sqrt(dx*dx + dy*dy + dz*dz)
+            if norm > 1e-10:
+                r2 = norm**2
+                r3 = norm**3
+                r5 = r3 * r2
+                r7 = r5 * r2
     
-        T2 = np.zeros((3, 3, 3))
+                T0_x = -dx/r3
+                T0_y = -dy/r3
+                T0_z = -dz/r3
+                dphi_x += T0_x * q[j]
+                dphi_y += T0_y * q[j]
+                dphi_z += T0_z * q[j]
     
-        for j in np.where(norm > 1e-10)[0]:
-            T0 = -dist[j,:] / norm[j]**3    
-            T1 = np.identity(3)/norm[j]**3 - 3*np.ones((3,3)) * dist[j,:] * np.transpose(np.ones((3,3)) * dist[j,:])/norm[j]**5
+                dot_rd = dx*d[i,0] + dy*d[i,1] + dz*d[i,2]
+                T1_x = d[i, 0]/r3 - 3.0 * dx * dot_rd / r5
+                T1_y = d[i, 1]/r3 - 3.0 * dy * dot_rd / r5
+                T1_z = d[i, 2]/r3 - 3.0 * dz * dot_rd / r5
     
-            aux = np.zeros((3,3,3))
+                dphi_x += T1_x
+                dphi_y += T1_y
+                dphi_z += T1_z
     
-            for k in range(3):
-                aux[k,:,:] = np.ones((3,3)) * dist[j,:] * np.transpose(np.ones((3,3)) * dist[j,:])*dist[j,k]
-            aux *= -5/norm[j]**7
+                Q_rr = (dx*dx*Q[j,0,0] + dx*dy*Q[j,0,1] + dx*dz*Q[j,0,2] +
+                        dy*dx*Q[j,1,0] + dy*dy*Q[j,1,1] + dy*dz*Q[j,1,2] +
+                        dz*dx*Q[j,2,0] + dz*dy*Q[j,2,1] + dz*dz*Q[j,2,2])
     
-            for k in range(3):
-                aux[:,:,k] += np.identity(3) * dist[j,k] / norm[j]**5
+                Q_rx = dx * Q[j,0,0] + dy * Q[j,0,1] + dz * Q[j,0,2]
+                Q_ry = dx * Q[j,1,0] + dy * Q[j,1,1] + dz * Q[j,1,2]
+                Q_rz = dx * Q[j,2,0] + dy * Q[j,2,1] + dz * Q[j,2,2]
     
-            for k in range(3):
-                aux[:,k,:] += np.identity(3) * dist[j,k] / norm[j]**5
+                T2_x = Q_rx/r5 - 2.5 * dx * Q_rr / r7
+                T2_y = Q_ry/r5 - 2.5 * dy * Q_rr / r7
+                T2_z = Q_rz/r5 - 2.5 * dz * Q_rr / r7
     
-            T2 = aux
+                dphi_x += T2_x
+                dphi_y += T2_y
+                dphi_z += T2_z
     
-            for k in range(3):
-                dphi[k] += T0[k]*q[j] + np.sum(T1[k,:] * d[j,:]) + 0.5 * np.sum(np.sum(T2[k,:,:] * Q[j,:,:], axis = 1), axis = 0)
-    
-        dphi /=  (4*np.pi*ep_in)
-        result[0] =  np.dot(n, dphi) # Derivada direccional en la dirección normal
+        dphi_x /= (4.0 * np.pi * ep_in)
+        dphi_y /= (4.0 * np.pi * ep_in)
+        dphi_z /= (4.0 * np.pi * ep_in)
+        result[0] = n[0]*dphi_x + n[1]*dphi_y + n[2]*dphi_z
 
     dGdn_fun_perm = bempp_cl.api.GridFunction(dirichlet_space_ses, fun = lambda_fun_perm)
 
@@ -813,10 +871,19 @@ def solvation_energy_sphere(x_q, q, d_scaled, Q_scaled, alpha, ep_in, ep_ex, kap
 
         @bempp_cl.api.real_callable
         def charges_fun_var(x, n, i, result):
-            dist = x - x_q
-            norm = np.sqrt(np.sum((dist*dist), axis = 1))
-            T1 = np.transpose(dist.transpose()/norm**3)
-            phi_c = np.sum(T1[:]*mu[:]) # Solo considera la componente polarizable, la componente permanente se considera en el lado constante del RHS
+            phi_c = 0.0
+            for j in range(len(x_q)):
+                dx = x[0] - x_q[j, 0]
+                dy = x[1] - x_q[j, 1]
+                dz = x[2] - x_q[j, 2]
+                norm = np.sqrt(dx*dx + dy*dy + dz*dz)
+                if norm > 1e-10:
+        
+                    T1_x = dx/(norm**3)
+                    T1_y = dy/(norm**3)
+                    T1_z = dz/(norm**3)
+                    phi_c += T1_x*mu[j,0] + T1_y*mu[j,1] + T1_z*mu[j,2]
+        
             result[0] = phi_c/(4*np.pi*ep_in)
 
         G_fun_var = bempp_cl.api.GridFunction(dirichlet_space_ses, fun = charges_fun_var)
@@ -828,18 +895,31 @@ def solvation_energy_sphere(x_q, q, d_scaled, Q_scaled, alpha, ep_in, ep_ex, kap
 
         @bempp_cl.api.real_callable
         def lambda_fun_var(x, n, i, result):
-            dist = x - x_q
-            norm = np.sqrt(np.sum((dist*dist), axis = 1))
-            dphi = np.zeros((3))
+            dphi_x = 0.0
+            dphi_y = 0.0
+            dphi_z = 0.0
+            for j in range(len(x_q)):
+                dx = x[0] - x_q[j, 0]
+                dy = x[1] - x_q[j, 1]
+                dz = x[2] - x_q[j, 2]
+                norm = np.sqrt(dx*dx + dy*dy + dz*dz)
+                if norm > 1e-10:
+                    r3 = norm**3
+                    r5 = r3 * norm**2
         
-            for j in np.where(norm > 1e-10)[0]:  
-                T1 = np.identity(3)/norm[j]**3 - 3*np.ones((3,3)) * dist[j,:] * np.transpose(np.ones((3,3)) * dist[j,:])/norm[j]**5
+                    dot_rd = dx*mu[i,0] + dy*mu[i,1] + dz*mu[i,2]
+                    T1_x = mu[i, 0]/r3 - 3.0 * dx * dot_rd / r5
+                    T1_y = mu[i, 1]/r3 - 3.0 * dy * dot_rd / r5
+                    T1_z = mu[i, 2]/r3 - 3.0 * dz * dot_rd / r5
         
-                for k in range(3):
-                    dphi[k] += np.sum(T1[k,:] * mu[j,:])
+                    dphi_x += T1_x
+                    dphi_y += T1_y
+                    dphi_z += T1_z
         
-            dphi /=  (4*np.pi*ep_in)
-            result[0] =  np.dot(n, dphi) # Derivada direccional en la dirección normal
+            dphi_x /= (4.0 * np.pi * ep_in)
+            dphi_y /= (4.0 * np.pi * ep_in)
+            dphi_z /= (4.0 * np.pi * ep_in)
+            result[0] = n[0]*dphi_x + n[1]*dphi_y + n[2]*dphi_z
 
         dGdn_fun_var = bempp_cl.api.GridFunction(dirichlet_space_ses, fun = lambda_fun_var)
         
@@ -850,17 +930,6 @@ def solvation_energy_sphere(x_q, q, d_scaled, Q_scaled, alpha, ep_in, ep_ex, kap
         fem_rhs_var = mass_ses_sparse @ (trace_ses.T @ neumann_values_var)
         fem_rhs_array = fem_rhs_perm + fem_rhs_var
         cterm_rhs = np.concatenate([fem_rhs_array, bem_rhs])
-
-        #g = fem.Function(P1_space)
-        #values = g.x.array
-        #values[:] = trace_ses.T @ neumann_values
-        #g.x.scatter_forward()
-        #L = f * v * dx + g('+') * v('+') * ds(1)
-        #fem_rhs = fem.petsc.assemble_vector(fem.form(L))
-        #fem_rhs.ghostUpdate(addv=petsc4py.PETSc.InsertMode.ADD_VALUES, mode=petsc4py.PETSc.ScatterMode.REVERSE)
-        #fem_rhs_array = fem_rhs.array # Condición de Neumann impuesta de forma debil (opción 1 del apunte)
-
-        #fem_rhs = trace_ses.T @ neumann_values # aplicar directamente los valores a los nodos (opción 2 del apunte)
 
         residuals = []
 
@@ -883,30 +952,17 @@ def solvation_energy_sphere(x_q, q, d_scaled, Q_scaled, alpha, ep_in, ep_ex, kap
         sol_prev = sol.copy()
         
         phi_hat  = sol[:fem_ndof] # Componente de corrección en la ubicación de los dofs
-        dphi_hat = sol[fem_ndof:]
         
         #--- 3. Determinar phi0 en la ubicación de los dofs y multipolos ---#
         
         G_fun = G_fun_perm + G_fun_var
         
-        x_dofs = fenics_space.tabulate_dof_coordinates() # ndof x 3
-        
-        slpo = single_layer(neumann_space_ses, np.transpose(x_dofs))
-        dlpo = double_layer(dirichlet_space_ses, np.transpose(x_dofs))
-        phi0_dofs = slpo * dphi0dn + dlpo * G_fun # Componente armónica en los dofs
-        
-        slpo = single_layer(neumann_space_ses, np.transpose(x_q))
-        dlpo = double_layer(dirichlet_space_ses, np.transpose(x_q))        
-        phi0_mult = slpo * dphi0dn + dlpo * G_fun # Componente armónica en los multipolos
-        
-        #--- 4. Determinar la componente de corrección en la ubicación de los multipolos ---#
-        
-        phi_hat_mult = compute_reaction_potential(phi_hat, x_q, fenics_space)
+        phi0_dofs_solvent = slpo_dofs * dphi0dn + dlpo_dofs * G_fun # Componente armónica en los dofs
+        phi0_dofs[solute_dofs] = phi0_dofs_solvent[0]
         
         #--- 5. Se calcula el potencial de reacción en los dofs y multipolos ---#
         
-        phi_rf_dofs = phi_hat + phi0_dofs[0]
-        phi_rf_mult = phi_hat_mult + phi0_mult[0]
+        phi_rf_dofs = phi_hat + phi0_dofs
         
         #--- 6. Calcular derivadas con funciones de forma ---#
         
@@ -933,6 +989,10 @@ def solvation_energy_sphere(x_q, q, d_scaled, Q_scaled, alpha, ep_in, ep_ex, kap
             break
         print(F"Induced dipole residual: {dipole_diff}")
         
+    phi_hat_mult = compute_reaction_potential(phi_hat, x_q, fenics_space)
+    phi0_mult = slpo_mult * dphi0dn + dlpo_mult * G_fun
+    phi_rf_mult = phi_hat_mult + phi0_mult[0]
+
     G_diss_solv = solvation_energy(q, d, Q, phi_rf_mult, dphi_rf, ddphi_rf)
     print(F"Solvent contributión: {G_diss_solv}")
     G_diss_mult = coulomb_energy_multipole(q, d, mu, Q, alpha, x_q, ep_in)

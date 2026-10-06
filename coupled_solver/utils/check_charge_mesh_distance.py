@@ -84,7 +84,7 @@ def check_charge_mesh_distance(mesh, x_q, cell_tags=None, solute_marker=None,
         n_candidates = len(cell_candidates.links(i))
 
         if len(links) == 0:
-            print(f"[carga {i}] ADVERTENCIA: no se encontro celda que "
+            print(f"[carga {i}] Ojito: no se encontro celda que "
                   f"contenga el punto {p}. Puede estar fuera del dominio "
                   f"o justo en el borde con tolerancia insuficiente.")
             results.append(None)
